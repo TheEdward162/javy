@@ -29,7 +29,7 @@ mod tests {
         Random.register(&runtime, &APIConfig::default())?;
         let ctx = runtime.context();
         ctx.eval_global("test.js", "result = Math.random()")?;
-        let result = ctx.global_object()?.get_property("result")?.as_f64()?;
+        let result = f64::try_from(&ctx.global_object()?.get_property("result")?)?;
         assert!(result >= 0.0);
         assert!(result < 1.0);
         Ok(())

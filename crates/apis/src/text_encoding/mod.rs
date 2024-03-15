@@ -35,7 +35,7 @@ fn decode_utf8_buffer_to_js_string(
             return Err(anyhow!("Expecting 5 arguments, received {}", args.len()));
         }
 
-        let buffer: Vec<u8> = (&args[0]).try_into()?;
+        let buffer: &[u8] = (&args[0]).try_into()?;
         let byte_offset: usize = (&args[1]).try_into()?;
         let byte_length: usize = (&args[2]).try_into()?;
         let fatal: bool = (&args[3]).try_into()?;
@@ -74,8 +74,8 @@ fn encode_js_string_to_utf8_buffer(
             return Err(anyhow!("Expecting 1 argument, got {}", args.len()));
         }
 
-        let js_string: String = (&args[0]).try_into()?;
-        Ok(js_string.into_bytes().into())
+        let js_string: &str = (&args[0]).try_into()?;
+        Ok(js_string.as_bytes().into())
     }
 }
 
@@ -96,7 +96,7 @@ mod tests {
             "main",
             "let encoder = new TextEncoder(); let buffer = encoder.encode('hello'); let decoder = new TextDecoder(); decoder.decode(buffer) == 'hello';"
         )?;
-        assert!(result.as_bool()?);
+        assert!(bool::try_from(&result)?);
         Ok(())
     }
 }

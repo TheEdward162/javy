@@ -78,6 +78,8 @@ impl<'a> Properties<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::js_binding::value::JSValueType;
+
     use super::super::context::JSContextRef;
     use anyhow::Result;
 
@@ -91,13 +93,13 @@ mod tests {
 
         let mut props = o.properties()?;
         let a = props.next_key()?.unwrap();
-        assert!(a.is_str());
+        assert_eq!(a.type_of(), JSValueType::String);
 
         let b = props.next_key()?.unwrap();
-        assert!(b.is_str());
+        assert_eq!(b.type_of(), JSValueType::String);
 
         let c = props.next_key()?.unwrap();
-        assert!(c.is_str());
+        assert_eq!(c.type_of(), JSValueType::String);
 
         let d = props.next_key()?;
         assert!(d.is_none());
@@ -116,15 +118,15 @@ mod tests {
         let mut props = o.properties()?;
         props.next_key()?;
         let a = props.next_value()?;
-        assert!(a.is_repr_as_i32());
+        assert_eq!(a.type_of(), JSValueType::Int);
 
         props.next_key()?;
         let b = props.next_value()?;
-        assert!(b.is_repr_as_i32());
+        assert_eq!(b.type_of(), JSValueType::Int);
 
         props.next_key()?;
         let c = props.next_value()?;
-        assert!(c.is_array());
+        assert_eq!(c.type_of(), JSValueType::Array);
 
         Ok(())
     }

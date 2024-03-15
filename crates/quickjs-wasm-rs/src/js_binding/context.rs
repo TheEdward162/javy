@@ -243,6 +243,32 @@ impl JSContextRef {
         JSValueRef::new(self, raw)
     }
 
+    pub(super) fn value_from_bytecode(&self, bytecode: &[u8]) -> Result<JSValueRef> {
+        JSValueRef::new(self, unsafe {
+            JS_ReadObject(
+                self.inner,
+                bytecode.as_ptr(),
+                bytecode.len().try_into()?,
+                JS_READ_OBJ_BYTECODE.try_into()?,
+            )
+        })
+    }
+
+    pub fn wrap_callback<F>(&self, f: F) -> Result<JSValueRef>
+    where
+        F: (FnMut(&Self, &JSValueRef, &[JSValueRef]) -> Result<js_value::JSValue>) + 'static,
+    {
+        super::callback::wrap(f).into_js_value(self)
+    }
+
+    pub fn new_callback<F>(&self, f: F) -> Result<JSValueRef>
+    where
+        F: FnMut(*mut JSContext, JSValue, c_int, *mut JSValue) -> JSValue + 'static,
+    {
+        super::callback::Callback::new(f).into_js_value(self)
+    }
+}
+impl JSContextRef {
     /// Creates a new JavaScript Array object.
     pub fn array_value(&self) -> Result<JSValueRef> {
         let raw = unsafe { JS_NewArray(self.inner) };
@@ -260,17 +286,6 @@ impl JSContextRef {
     pub fn object_value(&self) -> Result<JSValueRef> {
         let raw = unsafe { JS_NewObject(self.inner) };
         JSValueRef::new(self, raw)
-    }
-
-    pub(super) fn value_from_bytecode(&self, bytecode: &[u8]) -> Result<JSValueRef> {
-        JSValueRef::new(self, unsafe {
-            JS_ReadObject(
-                self.inner,
-                bytecode.as_ptr(),
-                bytecode.len().try_into()?,
-                JS_READ_OBJ_BYTECODE.try_into()?,
-            )
-        })
     }
 
     /// Creates a new JavaScript Number object from a `f64` value.
@@ -335,20 +350,6 @@ impl JSContextRef {
     pub fn undefined_value(&self) -> Result<JSValueRef> {
         JSValueRef::new(self, unsafe { ext_js_undefined })
     }
-
-    pub fn wrap_callback<F>(&self, f: F) -> Result<JSValueRef>
-    where
-        F: (FnMut(&Self, &JSValueRef, &[JSValueRef]) -> Result<js_value::JSValue>) + 'static,
-    {
-        super::callback::wrap(f).into_js_value(self)
-    }
-
-    pub fn new_callback<F>(&self, f: F) -> Result<JSValueRef>
-    where
-        F: FnMut(*mut JSContext, JSValue, c_int, *mut JSValue) -> JSValue + 'static,
-    {
-        super::callback::Callback::new(f).into_js_value(self)
-    }
 }
 impl Debug for JSContextRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -363,6 +364,8 @@ enum EvalType {
 
 #[cfg(test)]
 mod tests {
+    use crate::js_binding::value::JSValueType;
+
     use super::JSContextRef;
     use anyhow::Result;
     const SCRIPT_NAME: &str = "context.js";
@@ -436,8 +439,8 @@ mod tests {
         let bytecode = ctx.compile_global(SCRIPT_NAME, contents)?;
         let _ = ctx.eval_binary(&bytecode)?;
         assert_eq!(
-            42,
-            ctx.global_object()?.get_property("foo")?.try_as_integer()?
+            i64::try_from(&ctx.global_object()?.get_property("foo")?)?,
+            42
         );
         Ok(())
     }
@@ -448,7 +451,10 @@ mod tests {
         let contents = "var foo = 42;";
         let bytecode = ctx.compile_module(SCRIPT_NAME, contents)?;
         let _ = ctx.eval_binary(&bytecode)?;
-        assert!(ctx.global_object()?.get_property("foo")?.is_undefined());
+        assert_eq!(
+            ctx.global_object()?.get_property("foo")?.type_of(),
+            JSValueType::Undefined
+        );
         Ok(())
     }
 
@@ -459,8 +465,8 @@ mod tests {
         let bytecode = ctx.compile_module(SCRIPT_NAME, "foo += 1;")?;
         let _ = ctx.eval_binary(&bytecode)?;
         assert_eq!(
-            2,
-            ctx.global_object()?.get_property("foo")?.try_as_integer()?
+            i64::try_from(&ctx.global_object()?.get_property("foo")?)?,
+            2
         );
         Ok(())
     }
@@ -493,7 +499,7 @@ mod tests {
         let ctx = JSContextRef::default();
         let val = f64::MIN;
         let val = ctx.value_from_f64(val)?;
-        assert!(val.is_repr_as_f64());
+        assert_eq!(val.type_of(), JSValueType::Float);
         Ok(())
     }
 
@@ -502,7 +508,7 @@ mod tests {
         let ctx = JSContextRef::default();
         let val = i32::MIN;
         let val = ctx.value_from_i32(val)?;
-        assert!(val.is_repr_as_i32());
+        assert_eq!(val.type_of(), JSValueType::Int);
         Ok(())
     }
 
@@ -511,7 +517,7 @@ mod tests {
         let ctx = JSContextRef::default();
         let val = u32::MIN;
         let val = ctx.value_from_u32(val)?;
-        assert!(val.is_repr_as_i32());
+        assert_eq!(val.type_of(), JSValueType::Int);
         Ok(())
     }
 
@@ -519,7 +525,7 @@ mod tests {
     fn test_creates_a_value_from_bool() -> Result<()> {
         let ctx = JSContextRef::default();
         let val = ctx.value_from_bool(false)?;
-        assert!(val.is_bool());
+        assert_eq!(val.type_of(), JSValueType::Bool);
         Ok(())
     }
 
@@ -528,7 +534,7 @@ mod tests {
         let ctx = JSContextRef::default();
         let val = "script.js";
         let val = ctx.value_from_str(val)?;
-        assert!(val.is_str());
+        assert_eq!(val.type_of(), JSValueType::String);
         Ok(())
     }
 
@@ -536,7 +542,7 @@ mod tests {
     fn test_constructs_a_value_as_an_array() -> Result<()> {
         let ctx = JSContextRef::default();
         let val = ctx.array_value()?;
-        assert!(val.is_array());
+        assert_eq!(val.type_of(), JSValueType::Array);
         Ok(())
     }
 
@@ -544,7 +550,7 @@ mod tests {
     fn test_constructs_a_value_as_an_object() -> Result<()> {
         let ctx = JSContextRef::default();
         let val = ctx.object_value()?;
-        assert!(val.is_object());
+        assert_eq!(val.type_of(), JSValueType::Object);
         Ok(())
     }
 

@@ -72,7 +72,7 @@ pub use quickjs_wasm_sys;
 pub use crate::js_binding::context::JSContextRef;
 pub use crate::js_binding::error::JSError;
 pub use crate::js_binding::exception::Exception;
-pub use crate::js_binding::value::JSValueRef;
+pub use crate::js_binding::value::{JSValueRef, JSValueType};
 pub use crate::js_value::qjs_convert::*;
 pub use crate::js_value::JSValue;
 pub use crate::serialize::de::Deserializer;

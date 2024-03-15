@@ -265,7 +265,9 @@ mod test {
                 }}"
             ),
         )?;
-        assert!(ctx.global_object()?.get_property("result")?.as_bool()?);
+        assert!(bool::try_from(
+            &ctx.global_object()?.get_property("result")?
+        )?);
         Ok(())
     }
 
@@ -280,8 +282,8 @@ mod test {
         let res = ctx.eval_global("main", "foo();");
         let err = res.unwrap_err();
         assert_eq!(
-            "Uncaught InternalError: Error containing  - truncated due to null byte\n    at <eval> (main)\n",
-            err.to_string()
+            err.to_string(),
+            "Uncaught InternalError: Error containing  - truncated due to null byte\n    at <eval> (main)\n"
         );
         Ok(())
     }
@@ -344,10 +346,7 @@ mod test {
             result = foo.a() + foo.b();
             "#,
         )?;
-        let result = ctx
-            .global_object()?
-            .get_property("result")?
-            .as_i32_unchecked();
+        let result = i64::try_from(&ctx.global_object()?.get_property("result")?).unwrap();
 
         assert_eq!(result, 12);
 

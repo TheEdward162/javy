@@ -1,3 +1,5 @@
+use crate::js_binding::value::JSValueType;
+
 use super::{context::JSContextRef, value::JSValueRef};
 use anyhow::{anyhow, Result};
 use quickjs_wasm_sys::{JS_GetException, JS_IsError};
@@ -39,15 +41,15 @@ impl Exception {
     }
 
     pub fn from(exception_obj: JSValueRef) -> Result<Self> {
-        let msg = exception_obj.as_str().map(ToString::to_string)?;
+        let msg = exception_obj.try_to_str()?.to_string();
         let mut stack = None;
 
         let is_error =
-            unsafe { JS_IsError(exception_obj.context.as_raw(), exception_obj.as_raw()) } != 0;
+            unsafe { JS_IsError(exception_obj.context.as_raw(), exception_obj.as_raw()) } == 1;
         if is_error {
             let stack_value = exception_obj.get_property("stack")?;
-            if !stack_value.is_undefined() {
-                stack.replace(stack_value.as_str().map(ToString::to_string)?);
+            if stack_value.type_of() != JSValueType::Undefined {
+                stack.replace(<&str>::try_from(&stack_value)?.to_string());
             }
         }
 

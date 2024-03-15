@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use quickjs_wasm_sys::{
-    JS_TAG_BOOL, JS_TAG_INT, JS_TAG_NULL, JS_TAG_OBJECT, JS_TAG_STRING, JS_TAG_UNDEFINED,
-};
 
 use super::JSValue;
-use crate::js_binding::{context::JSContextRef, value::JSValueRef};
+use crate::js_binding::{
+    context::JSContextRef,
+    value::{JSValueRef, JSValueType},
+};
 
 /// Converts a reference to QuickJS value represented by `quickjs_wasm_rs::JSValueRef` to a `JSValue`.
 ///
@@ -26,46 +26,36 @@ use crate::js_binding::{context::JSContextRef, value::JSValueRef};
 /// assert_eq!(js_val, "hello".into());
 /// ```
 pub fn from_qjs_value(val: &JSValueRef) -> Result<JSValue> {
-    let tag = val.get_tag();
-    let js_val = match tag {
-        JS_TAG_NULL => JSValue::Null,
-        JS_TAG_UNDEFINED => JSValue::Undefined,
-        JS_TAG_BOOL => JSValue::Bool(val.as_bool()?),
-        JS_TAG_INT => JSValue::Int(val.as_i32_unchecked()),
-        JS_TAG_STRING => {
-            // need to use as_str_lossy here otherwise a wpt test fails because there is a test case
-            // that has a string with invalid utf8
-            JSValue::String(val.as_str_lossy().to_string())
-        }
-        JS_TAG_OBJECT => {
-            if val.is_array() {
-                let array_len = from_qjs_value(&val.get_property("length")?)?.try_into()?;
-                let mut result = Vec::with_capacity(array_len);
-                for i in 0..array_len {
-                    result.push(from_qjs_value(&val.get_indexed_property(i.try_into()?)?)?);
-                }
-                JSValue::Array(result)
-            } else if val.is_array_buffer() {
-                let bytes = val.as_bytes()?;
-                JSValue::ArrayBuffer(bytes.to_vec())
-            } else {
-                let mut result = HashMap::new();
-                let mut properties = val.properties()?;
-                while let Some(property_key) = properties.next_key()? {
-                    let property_key = property_key.as_str()?;
-                    let property_value = from_qjs_value(&val.get_property(property_key)?)?;
-                    result.insert(property_key.to_string(), property_value);
-                }
-
-                JSValue::Object(result)
+    let js_val = match val.type_of() {
+        JSValueType::Null => JSValue::Null,
+        JSValueType::Undefined => JSValue::Undefined,
+        JSValueType::Bool => JSValue::Bool(val.try_into()?),
+        JSValueType::Int | JSValueType::BigInt => JSValue::Int(i64::try_from(val)?.try_into()?),
+        JSValueType::Float | JSValueType::BigFloat => JSValue::Float(f64::try_from(val)?),
+        JSValueType::String => JSValue::String(<&str>::try_from(val)?.to_owned()),
+        JSValueType::Array => {
+            let array_len = u64::try_from(&val.get_property("length")?)? as usize;
+            let mut result = Vec::with_capacity(array_len);
+            for i in 0..array_len {
+                result.push(from_qjs_value(&val.get_indexed_property(i.try_into()?)?)?);
             }
+            JSValue::Array(result)
         }
-        _ if val.is_repr_as_f64() => {
-            // Matching on JS_TAG_FLOAT64 does not seem to catch floats so we have to check for float separately.
-            JSValue::Float(val.as_f64_unchecked())
+        JSValueType::ArrayBuffer => JSValue::ArrayBuffer(<&[u8]>::try_from(val)?.to_vec()),
+        JSValueType::Object => {
+            let mut result = HashMap::new();
+            let mut properties = val.properties()?;
+            while let Some(property_key) = properties.next_key()? {
+                let property_key = <&str>::try_from(&property_key)?;
+                let property_value = from_qjs_value(&val.get_property(property_key)?)?;
+                result.insert(property_key.to_string(), property_value);
+            }
+
+            JSValue::Object(result)
         }
-        _ => bail!("unhandled tag: {}", tag),
+        t => bail!("unhandled type: {:?}", t),
     };
+
     Ok(js_val)
 }
 
@@ -209,7 +199,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = JSValue::Null;
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert!(qjs_val.is_null());
+        assert_eq!(qjs_val.type_of(), JSValueType::Null);
     }
 
     #[test]
@@ -217,7 +207,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = JSValue::Undefined;
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert!(qjs_val.is_undefined());
+        assert_eq!(qjs_val.type_of(), JSValueType::Undefined);
     }
 
     #[test]
@@ -225,7 +215,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = true.into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert!(qjs_val.as_bool().unwrap());
+        assert_eq!(qjs_val.type_of(), JSValueType::Bool);
     }
 
     #[test]
@@ -233,7 +223,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = 42.into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert_eq!(42, qjs_val.as_i32_unchecked());
+        assert_eq!(i64::try_from(&qjs_val).unwrap(), 42);
     }
 
     #[test]
@@ -241,7 +231,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = 42.3.into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert_eq!(42.3, qjs_val.as_f64_unchecked());
+        assert_eq!(f64::try_from(&qjs_val).unwrap(), 42.3);
     }
 
     #[test]
@@ -249,7 +239,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = "hello".into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert_eq!("hello", qjs_val.as_str().unwrap());
+        assert_eq!(<&str>::try_from(&qjs_val).unwrap(), "hello");
     }
 
     #[test]
@@ -257,7 +247,7 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = "hello".as_bytes().into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert_eq!("hello".as_bytes(), qjs_val.as_bytes().unwrap());
+        assert_eq!(<&[u8]>::try_from(&qjs_val).unwrap(), "hello".as_bytes());
     }
 
     #[test]
@@ -265,20 +255,68 @@ mod tests {
         let context = JSContextRef::default();
         let js_val = vec![JSValue::Int(1), JSValue::Int(2)].into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert_eq!(1, qjs_val.get_property("0").unwrap().as_i32_unchecked());
-        assert_eq!(2, qjs_val.get_property("1").unwrap().as_i32_unchecked());
+        assert_eq!(
+            i64::try_from(&qjs_val.get_property("0").unwrap()).unwrap(),
+            1
+        );
+        assert_eq!(
+            u64::try_from(&qjs_val.get_property("1").unwrap()).unwrap(),
+            2
+        );
     }
 
     #[test]
     fn test_to_qjs_object() {
         let context = JSContextRef::default();
         let js_val = HashMap::from([
-            ("a".to_string(), JSValue::Int(1)),
+            ("a".to_string(), JSValue::Int(-1)),
             ("b".to_string(), JSValue::Int(2)),
         ])
         .into();
         let qjs_val = to_qjs_value(&context, &js_val).unwrap();
-        assert_eq!(1, qjs_val.get_property("a").unwrap().as_i32_unchecked());
-        assert_eq!(2, qjs_val.get_property("b").unwrap().as_i32_unchecked());
+        assert_eq!(
+            i64::try_from(&qjs_val.get_property("a").unwrap()).unwrap(),
+            -1
+        );
+        assert_eq!(
+            u64::try_from(&qjs_val.get_property("b").unwrap()).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_convert_vec() -> Result<()> {
+        let context = JSContextRef::default();
+        let val = context.eval_global("test.js", "[1, 2, 3]")?;
+
+        let expected: Vec<JSValue> = vec![1.into(), 2.into(), 3.into()];
+
+        assert_eq!(val.to_string(), "1,2,3");
+
+        let val_ref = &val;
+        let arg = from_qjs_value(val_ref)?;
+        assert_eq!(arg, JSValue::Array(expected));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_hashmap() -> Result<()> {
+        let context = JSContextRef::default();
+        let val = context.eval_global("test.js", "({a: 1, b: 2, c: 3})")?;
+
+        let expected = HashMap::from([
+            ("a".to_string(), 1.into()),
+            ("b".to_string(), 2.into()),
+            ("c".to_string(), 3.into()),
+        ]);
+
+        assert_eq!(val.to_string(), "[object Object]");
+
+        let val_ref = &val;
+        let arg = from_qjs_value(val_ref)?;
+        assert_eq!(arg, JSValue::Object(expected));
+
+        Ok(())
     }
 }

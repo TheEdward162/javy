@@ -1,5 +1,7 @@
-use crate::js_binding::constants::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
-use crate::js_binding::{properties::Properties, value::BigInt, value::JSValueRef};
+use crate::js_binding::{
+    properties::Properties,
+    value::{JSValueRef, JSValueType},
+};
 use crate::serialize::err::{Error, Result};
 use anyhow::anyhow;
 use serde::de::{self, Error as SerError};
@@ -43,26 +45,16 @@ impl Deserializer<'_> {
     where
         V: de::Visitor<'de>,
     {
-        if self.value.is_repr_as_i32() {
-            return visitor.visit_i32(self.value.as_i32_unchecked());
+        if let Ok(uint) = u64::try_from(&self.value) {
+            return visitor.visit_u64(uint);
+        }
+        if let Ok(int) = i64::try_from(&self.value) {
+            return visitor.visit_i64(int);
+        }
+        if let Ok(float) = f64::try_from(&self.value) {
+            return visitor.visit_f64(float);
         }
 
-        if self.value.is_repr_as_f64() {
-            let f64_representation = self.value.as_f64_unchecked();
-            let is_positive = f64_representation.is_sign_positive();
-            let safe_integer_range = (MIN_SAFE_INTEGER as f64)..=(MAX_SAFE_INTEGER as f64);
-            let whole = f64_representation.fract() == 0.0;
-
-            if whole && is_positive && f64_representation <= u32::MAX as f64 {
-                return visitor.visit_u32(f64_representation as u32);
-            }
-
-            if whole && safe_integer_range.contains(&f64_representation) {
-                return visitor.visit_i64(f64_representation as i64);
-            }
-
-            return visitor.visit_f64(f64_representation);
-        }
         unreachable!()
     }
 }
@@ -74,62 +66,41 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: de::Visitor<'de>,
     {
-        if self.value.is_number() {
-            return self.deserialize_number(visitor);
-        }
+        match self.value.type_of() {
+            JSValueType::Int | JSValueType::BigInt | JSValueType::Float | JSValueType::BigFloat => {
+                self.deserialize_number(visitor)
+            }
+            JSValueType::Bool => visitor.visit_bool(bool::try_from(&self.value).unwrap()),
+            JSValueType::Null | JSValueType::Undefined => visitor.visit_unit(),
+            JSValueType::String => visitor.visit_str(<&str>::try_from(&self.value).unwrap()),
+            JSValueType::Array => {
+                let val = self.value.get_property("length")?;
+                let length = u64::try_from(&val).unwrap() as u32;
+                let seq = self.value.clone();
 
-        if self.value.is_big_int() {
-            let v = self.value.as_big_int_unchecked()?;
-            return match v {
-                BigInt::Signed(v) => visitor.visit_i64(v),
-                BigInt::Unsigned(v) => visitor.visit_u64(v),
-            };
-        }
-
-        if self.value.is_bool() {
-            let val = self.value.as_bool()?;
-            return visitor.visit_bool(val);
-        }
-
-        if self.value.is_null_or_undefined() {
-            return visitor.visit_unit();
-        }
-
-        if self.value.is_str() {
-            let val = self.value.as_str()?;
-            return visitor.visit_str(val);
-        }
-
-        if self.value.is_array() {
-            let val = self.value.get_property("length")?;
-            let length = val.as_u32_unchecked();
-            let seq = self.value.clone();
-            let seq_access = SeqAccess {
-                de: self,
-                length,
-                seq,
-                index: 0,
-            };
-            return visitor.visit_seq(seq_access);
-        }
-
-        if self.value.is_object() {
-            if self.value.is_array_buffer() {
-                return visitor.visit_bytes(self.value.as_bytes()?);
-            } else {
+                visitor.visit_seq(SeqAccess {
+                    de: self,
+                    length,
+                    seq,
+                    index: 0,
+                })
+            }
+            JSValueType::ArrayBuffer => {
+                visitor.visit_bytes(<&[u8]>::try_from(&self.value).unwrap())
+            }
+            JSValueType::Object => {
                 let properties = self.value.properties()?;
-                let map_access = MapAccess {
+
+                visitor.visit_map(MapAccess {
                     de: self,
                     properties,
-                };
-                return visitor.visit_map(map_access);
+                })
             }
+            _ => Err(Error::Custom(anyhow!(
+                "Couldn't deserialize value: {:?}",
+                self.value
+            ))),
         }
-
-        Err(Error::Custom(anyhow!(
-            "Couldn't deserialize value: {:?}",
-            self.value
-        )))
     }
 
     fn is_human_readable(&self) -> bool {
@@ -140,10 +111,9 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: de::Visitor<'de>,
     {
-        if self.value.is_null_or_undefined() {
-            visitor.visit_none()
-        } else {
-            visitor.visit_some(self)
+        match self.value.type_of() {
+            JSValueType::Null | JSValueType::Undefined => visitor.visit_none(),
+            _ => visitor.visit_some(self),
         }
     }
 

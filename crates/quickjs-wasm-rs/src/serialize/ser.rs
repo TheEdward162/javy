@@ -321,10 +321,11 @@ impl<'a> ser::SerializeMap for &'a mut Serializer<'_> {
         let mut map_serializer = Serializer::from_context(self.context)?;
         value.serialize(&mut map_serializer)?;
 
-        if !self.key.is_str() {
-            return Err(anyhow::anyhow!("map keys must be a string").into());
-        }
-        let key = self.key.as_str()?;
+        let key = match <&str>::try_from(&self.key) {
+            Err(_) => return Err(anyhow::anyhow!("map keys must be a string").into()),
+            Ok(k) => k,
+        };
+
         self.value.set_property(key, map_serializer.value)?;
         Ok(())
     }
@@ -380,6 +381,7 @@ mod tests {
     use crate::js_binding::{
         constants::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER},
         context::JSContextRef,
+        value::JSValueType,
     };
     use anyhow::Result;
     use quickcheck::quickcheck;
@@ -391,14 +393,14 @@ mod tests {
             let context = JSContextRef::default();
             let mut serializer = ValueSerializer::from_context(&context)?;
             serializer.serialize_i16(v)?;
-            Ok(serializer.value.is_repr_as_i32())
+            Ok(matches!(serializer.value.type_of(), JSValueType::Int))
         }
 
         fn test_i32(v: i32) -> Result<bool> {
             let context = JSContextRef::default();
             let mut serializer = ValueSerializer::from_context(&context)?;
             serializer.serialize_i32(v)?;
-            Ok(serializer.value.is_repr_as_i32())
+            Ok(matches!(serializer.value.type_of(), JSValueType::Int))
         }
 
         fn test_i64(v: i64) -> Result<bool> {
@@ -406,9 +408,9 @@ mod tests {
             let mut serializer = ValueSerializer::from_context(&context)?;
             serializer.serialize_i64(v)?;
             if (MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&v) {
-                Ok(serializer.value.is_number())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Int | JSValueType::Float))
             } else {
-                Ok(serializer.value.is_big_int())
+                Ok(matches!(serializer.value.type_of(), JSValueType::BigInt))
             }
         }
 
@@ -418,9 +420,9 @@ mod tests {
             serializer.serialize_u64(v)?;
 
             if v <= MAX_SAFE_INTEGER as u64 {
-                Ok(serializer.value.is_number())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Int | JSValueType::Float))
             } else {
-                Ok(serializer.value.is_big_int())
+                Ok(matches!(serializer.value.type_of(), JSValueType::BigInt))
             }
         }
 
@@ -430,7 +432,7 @@ mod tests {
 
             serializer.serialize_u16(v)?;
 
-            Ok(serializer.value.is_repr_as_i32())
+            Ok(matches!(serializer.value.type_of(), JSValueType::Int))
         }
 
         fn test_u32(v: u32) -> Result<bool> {
@@ -441,9 +443,9 @@ mod tests {
             // QuickJS optimizes numbers in the range of [i32::MIN..=i32::MAX]
             // as ints
             if v > i32::MAX as u32 {
-                Ok(serializer.value.is_repr_as_f64())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Float))
             } else {
-                Ok(serializer.value.is_repr_as_i32())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Int))
             }
         }
 
@@ -454,12 +456,12 @@ mod tests {
 
             if v == 0.0_f32 {
                 if v.is_sign_positive() {
-                    return  Ok(serializer.value.is_repr_as_i32());
+                    return Ok(matches!(serializer.value.type_of(), JSValueType::Int));
                 }
 
 
                 if v.is_sign_negative() {
-                    return Ok(serializer.value.is_repr_as_f64());
+                    return Ok(matches!(serializer.value.type_of(), JSValueType::Float));
                 }
             }
 
@@ -469,9 +471,9 @@ mod tests {
             let range = (i32::MIN as f32)..=(i32::MAX as f32);
 
             if zero_fractional_part && range.contains(&v) {
-                Ok(serializer.value.is_repr_as_i32())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Int))
             } else {
-                Ok(serializer.value.is_repr_as_f64())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Float))
             }
         }
 
@@ -482,12 +484,12 @@ mod tests {
 
             if v == 0.0_f64 {
                 if v.is_sign_positive() {
-                    return  Ok(serializer.value.is_repr_as_i32());
+                    return Ok(matches!(serializer.value.type_of(), JSValueType::Int));
                 }
 
 
                 if v.is_sign_negative() {
-                    return Ok(serializer.value.is_repr_as_f64());
+                    return Ok(matches!(serializer.value.type_of(), JSValueType::Float));
                 }
             }
 
@@ -497,9 +499,9 @@ mod tests {
             let range = (i32::MIN as f64)..=(i32::MAX as f64);
 
             if zero_fractional_part && range.contains(&v) {
-                Ok(serializer.value.is_repr_as_i32())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Int))
             } else {
-                Ok(serializer.value.is_repr_as_f64())
+                Ok(matches!(serializer.value.type_of(), JSValueType::Float))
             }
         }
 
@@ -508,7 +510,7 @@ mod tests {
             let mut serializer = ValueSerializer::from_context(&context)?;
             serializer.serialize_bool(v)?;
 
-            Ok(serializer.value.is_bool())
+            Ok(matches!(serializer.value.type_of(), JSValueType::Bool))
         }
 
         fn test_str(v: String) -> Result<bool> {
@@ -516,7 +518,7 @@ mod tests {
             let mut serializer = ValueSerializer::from_context(&context)?;
             serializer.serialize_str(v.as_str())?;
 
-            Ok(serializer.value.is_str())
+            Ok(matches!(serializer.value.type_of(), JSValueType::String))
         }
     }
 
@@ -526,7 +528,7 @@ mod tests {
         let mut serializer = ValueSerializer::from_context(&context)?;
         serializer.serialize_unit()?;
 
-        assert!(serializer.value.is_null());
+        assert_eq!(serializer.value.type_of(), JSValueType::Null);
         Ok(())
     }
 
@@ -536,7 +538,7 @@ mod tests {
         let mut serializer = ValueSerializer::from_context(&context)?;
         serializer.serialize_f64(f64::NAN)?;
 
-        assert!(serializer.value.is_repr_as_f64());
+        assert_eq!(serializer.value.type_of(), JSValueType::Float);
         Ok(())
     }
 
@@ -546,7 +548,7 @@ mod tests {
         let mut serializer = ValueSerializer::from_context(&context)?;
         serializer.serialize_f64(f64::INFINITY)?;
 
-        assert!(serializer.value.is_repr_as_f64());
+        assert_eq!(serializer.value.type_of(), JSValueType::Float);
         Ok(())
     }
 
@@ -556,7 +558,7 @@ mod tests {
         let mut serializer = ValueSerializer::from_context(&context)?;
         serializer.serialize_f64(f64::NEG_INFINITY)?;
 
-        assert!(serializer.value.is_repr_as_f64());
+        assert_eq!(serializer.value.type_of(), JSValueType::Float);
         Ok(())
     }
 
@@ -573,7 +575,7 @@ mod tests {
         map.insert(43, "titi");
 
         let err = map.serialize(&mut serializer).unwrap_err();
-        assert_eq!("map keys must be a string".to_string(), err.to_string());
+        assert_eq!(err.to_string(), "map keys must be a string".to_string());
     }
 
     #[test]
@@ -587,7 +589,7 @@ mod tests {
 
         map.serialize(&mut serializer).unwrap();
 
-        assert!(serializer.value.is_object())
+        assert_eq!(serializer.value.type_of(), JSValueType::Object);
     }
 
     #[test]
@@ -607,7 +609,7 @@ mod tests {
         };
         my_object.serialize(&mut serializer).unwrap();
 
-        assert!(serializer.value.is_object());
+        assert_eq!(serializer.value.type_of(), JSValueType::Object);
     }
 
     #[test]
@@ -619,7 +621,7 @@ mod tests {
 
         sequence.serialize(&mut serializer).unwrap();
 
-        assert!(serializer.value.is_array());
+        assert_eq!(serializer.value.type_of(), JSValueType::Array);
     }
 
     #[test]
@@ -631,8 +633,11 @@ mod tests {
             .serialize(&mut serializer)
             .unwrap();
 
-        assert!(serializer.value.is_array_buffer());
+        assert_eq!(serializer.value.type_of(), JSValueType::ArrayBuffer);
 
-        assert_eq!(serializer.value.as_bytes().unwrap(), &[42u8, 0, 255]);
+        assert_eq!(
+            <&[u8]>::try_from(&serializer.value).unwrap(),
+            &[42u8, 0, 255]
+        );
     }
 }

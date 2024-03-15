@@ -1,27 +1,56 @@
+use std::fmt;
 use std::fmt::Debug;
-use std::{convert::TryInto, fmt};
+use std::ops::RangeInclusive;
 
 use super::context::JSContextRef;
 use super::exception::Exception;
 use super::properties::Properties;
-use crate::js_value::{qjs_convert::from_qjs_value, JSValue};
-use anyhow::{anyhow, Result};
+use anyhow::{self, Result};
 use quickjs_wasm_sys::{
-    size_t as JS_size_t, JSValue as JSValueRaw, JS_BigIntSigned, JS_BigIntToInt64,
-    JS_BigIntToUint64, JS_Call, JS_DefinePropertyValueStr, JS_DefinePropertyValueUint32,
-    JS_DupValue_Ext, JS_EvalFunction, JS_FreeValue_Ext, JS_GetArrayBuffer, JS_GetPropertyStr,
-    JS_GetPropertyUint32, JS_IsArray, JS_IsArrayBuffer_Ext, JS_IsFloat64_Ext, JS_IsFunction,
-    JS_ToCStringLen2, JS_ToFloat64, JS_PROP_C_W_E, JS_TAG_BIG_INT, JS_TAG_BOOL, JS_TAG_EXCEPTION,
-    JS_TAG_INT, JS_TAG_NULL, JS_TAG_OBJECT, JS_TAG_STRING, JS_TAG_UNDEFINED,
+    size_t as JS_size_t, JSValue as JSValueRaw, JS_BigIntToInt64, JS_BigIntToUint64, JS_Call,
+    JS_DefinePropertyValueStr, JS_DefinePropertyValueUint32, JS_DupValue_Ext, JS_EvalFunction,
+    JS_FreeValue_Ext, JS_GetArrayBuffer, JS_GetPropertyStr, JS_GetPropertyUint32, JS_IsArray,
+    JS_IsArrayBuffer_Ext, JS_IsFloat64_Ext, JS_IsFunction, JS_ToCStringLen2, JS_ToFloat64,
+    JS_ToInt64, JS_PROP_C_W_E, JS_TAG_BIG_FLOAT, JS_TAG_BIG_INT, JS_TAG_BOOL, JS_TAG_EXCEPTION,
+    JS_TAG_INT, JS_TAG_NULL, JS_TAG_OBJECT, JS_TAG_STRING, JS_TAG_SYMBOL, JS_TAG_UNDEFINED,
 };
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::str;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum BigInt {
-    Signed(i64),
-    Unsigned(u64),
+/// Describes the type of a QuickJS value.
+///
+/// Note that this is not the same as JavaScript type.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum JSValueType {
+    Unknown,
+    Int,
+    Bool,
+    Null,
+    Undefined,
+    Float,
+    BigInt,
+    BigFloat,
+    Symbol,
+    String,
+    Object,
+    Array,
+    ArrayBuffer,
+    Function,
+    Exception,
+}
+impl JSValueType {
+    pub fn is_int(&self) -> bool {
+        matches!(self, Self::Int | Self::BigInt)
+    }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::Float | Self::BigFloat)
+    }
+
+    pub fn is_null_or_undefined(&self) -> bool {
+        matches!(self, Self::Null | Self::Undefined)
+    }
 }
 
 /// `JSValueRef` is a wrapper around a QuickJS `JSValue` with a reference to its associated `JSContextRef`.
@@ -47,11 +76,12 @@ impl<'a> JSValueRef<'a> {
             value: raw_value,
         };
 
-        if value.is_exception() {
-            let exception = value.as_exception()?;
-            Err(exception.into_error())
-        } else {
-            Ok(value)
+        match value.type_of() {
+            JSValueType::Exception => {
+                let exception = value.as_exception()?;
+                Err(exception.into_error())
+            }
+            _ => Ok(value),
         }
     }
 
@@ -115,255 +145,9 @@ impl<'a> JSValueRef<'a> {
         Self::new(self.context, return_val)
     }
 
-    /// Converts the JavaScript value to an `i32` without checking its type.
-    pub fn as_i32_unchecked(&self) -> i32 {
-        self.value as i32
-    }
-
-    /// Converts the JavaScript value to a `u32` without checking its type.
-    pub fn as_u32_unchecked(&self) -> u32 {
-        self.value as u32
-    }
-
-    /// Converts the JavaScript value to an `f64` without checking its type.
-    pub fn as_f64_unchecked(&self) -> f64 {
-        let mut ret = 0_f64;
-        unsafe { JS_ToFloat64(self.context.as_raw(), &mut ret, self.value) };
-        ret
-    }
-
-    /// Converts the JavaScript value to a `BigInt` without checking its type.
-    pub fn as_big_int_unchecked(&self) -> Result<BigInt> {
-        if self.is_signed_big_int() {
-            let v = self.bigint_as_i64()?;
-            Ok(BigInt::Signed(v))
-        } else {
-            let v = self.bigint_as_u64()?;
-            Ok(BigInt::Unsigned(v))
-        }
-    }
-
-    fn is_signed_big_int(&self) -> bool {
-        unsafe { JS_BigIntSigned(self.context.as_raw(), self.value) == 1 }
-    }
-
-    fn bigint_as_i64(&self) -> Result<i64> {
-        let mut ret = 0_i64;
-        let err = unsafe { JS_BigIntToInt64(self.context.as_raw(), &mut ret, self.value) };
-        if err < 0 {
-            anyhow::bail!("big int underflow, value does not fit in i64");
-        }
-        Ok(ret)
-    }
-
-    fn bigint_as_u64(&self) -> Result<u64> {
-        let mut ret = 0_u64;
-        let err = unsafe { JS_BigIntToUint64(self.context.as_raw(), &mut ret, self.value) };
-        if err < 0 {
-            anyhow::bail!("big int overflow, value does not fit in u64");
-        }
-        Ok(ret)
-    }
-
-    /// Checks if the JavaScript value is a number.
-    ///
-    /// Returns `true` if the value is a number (either represented as an `f64` or an `i32`),
-    /// otherwise returns `false`.
-    pub fn is_number(&self) -> bool {
-        self.is_repr_as_f64() || self.is_repr_as_i32()
-    }
-
-    /// Checks if the JavaScript value is a `BigInt`.
-    ///
-    /// Returns `true` if the value is a `BigInt`, otherwise returns `false`.
-    pub fn is_big_int(&self) -> bool {
-        self.get_tag() == JS_TAG_BIG_INT
-    }
-
-    /// Converts the JavaScript value to an `f64` if it is a number, otherwise returns an error.
-    pub fn as_f64(&self) -> Result<f64> {
-        if self.is_repr_as_f64() {
-            return Ok(self.as_f64_unchecked());
-        }
-        if self.is_repr_as_i32() {
-            return Ok(self.as_i32_unchecked() as f64);
-        }
-        anyhow::bail!("Value is not a number")
-    }
-
-    /// Tries to convert the JavaScript value to an `i32` if it is an integer, otherwise returns an error.
-    pub fn try_as_integer(&self) -> Result<i32> {
-        if self.is_repr_as_f64() {
-            let v = self.as_f64_unchecked();
-            if v.trunc() != v {
-                anyhow::bail!("Value is not an integer");
-            }
-            return Ok((v as i64).try_into()?);
-        }
-        if self.is_repr_as_i32() {
-            return Ok(self.as_i32_unchecked());
-        }
-        anyhow::bail!("Value is not a number")
-    }
-
-    /// Converts the JavaScript value to a `bool` if it is a boolean, otherwise returns an error.
-    pub fn as_bool(&self) -> Result<bool> {
-        if self.is_bool() {
-            Ok(self.value as i32 > 0)
-        } else {
-            Err(anyhow!("Can't represent {:?} as bool", self.value))
-        }
-    }
-
-    /// Converts the JavaScript value to a string if it is a string.
-    pub fn as_str(&self) -> Result<&str> {
-        let buffer = self.as_wtf8_str_buffer();
-        str::from_utf8(buffer).map_err(Into::into)
-    }
-
-    /// Converts the JavaScript value to a string, replacing any invalid UTF-8 sequences with the
-    /// Unicode replacement character (U+FFFD).
-    pub fn as_str_lossy(&self) -> std::borrow::Cow<str> {
-        let mut buffer = self.as_wtf8_str_buffer();
-        match str::from_utf8(buffer) {
-            Ok(valid) => Cow::Borrowed(valid),
-            Err(mut error) => {
-                let mut res = String::new();
-                loop {
-                    let (valid, after_valid) = buffer.split_at(error.valid_up_to());
-                    res.push_str(unsafe { str::from_utf8_unchecked(valid) });
-                    res.push(char::REPLACEMENT_CHARACTER);
-
-                    // see https://simonsapin.github.io/wtf-8/#surrogate-byte-sequence
-                    let lone_surrogate =
-                        matches!(after_valid, [0xED, 0xA0..=0xBF, 0x80..=0xBF, ..]);
-
-                    // https://simonsapin.github.io/wtf-8/#converting-wtf-8-utf-8 states that each
-                    // 3-byte lone surrogate sequence should be replaced by 1 UTF-8 replacement
-                    // char. Rust's `Utf8Error` reports each byte in the lone surrogate byte
-                    // sequence as a separate error with an `error_len` of 1. Since we insert a
-                    // replacement char for each error, this results in 3 replacement chars being
-                    // inserted. So we use an `error_len` of 3 instead of 1 to treat the entire
-                    // 3-byte sequence as 1 error instead of as 3 errors and only emit 1
-                    // replacement char.
-                    let error_len = if lone_surrogate {
-                        3
-                    } else {
-                        error
-                            .error_len()
-                            .expect("Error length should always be available on underlying buffer")
-                    };
-
-                    buffer = &after_valid[error_len..];
-                    match str::from_utf8(buffer) {
-                        Ok(valid) => {
-                            res.push_str(valid);
-                            break;
-                        }
-                        Err(e) => error = e,
-                    }
-                }
-                Cow::Owned(res)
-            }
-        }
-    }
-
-    fn as_wtf8_str_buffer(&self) -> &[u8] {
-        unsafe {
-            let mut len: JS_size_t = 0;
-            let ptr = JS_ToCStringLen2(self.context.as_raw(), &mut len, self.value, 0);
-            let ptr = ptr as *const u8;
-            let len = len as usize;
-            std::slice::from_raw_parts(ptr, len)
-        }
-    }
-
-    /// Converts the JavaScript value to a byte slice if it is an ArrayBuffer, otherwise returns an error.
-    pub fn as_bytes(&self) -> Result<&[u8]> {
-        let mut len = 0;
-        let ptr = unsafe { JS_GetArrayBuffer(self.context.as_raw(), &mut len, self.value) };
-        if ptr.is_null() {
-            Err(anyhow!(
-                "Can't represent {:?} as an array buffer",
-                self.value
-            ))
-        } else {
-            Ok(unsafe { std::slice::from_raw_parts(ptr, len as _) })
-        }
-    }
-
-    /// Converts the JavaScript value to a mutable byte slice if it is an ArrayBuffer, otherwise returns an error.
-    pub fn as_bytes_mut(&self) -> Result<&mut [u8]> {
-        let mut len = 0;
-        let ptr = unsafe { JS_GetArrayBuffer(self.context.as_raw(), &mut len, self.value) };
-        if ptr.is_null() {
-            Err(anyhow!(
-                "Can't represent {:?} as an array buffer",
-                self.value
-            ))
-        } else {
-            Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len as _) })
-        }
-    }
-
     /// Retrieves the properties of the JavaScript value.
     pub fn properties(&self) -> Result<Properties<'a>> {
         Properties::new(self.context, self.clone())
-    }
-
-    /// Checks if the JavaScript value is represented as an `f64`.
-    pub fn is_repr_as_f64(&self) -> bool {
-        unsafe { JS_IsFloat64_Ext(self.get_tag()) == 1 }
-    }
-
-    /// Checks if the JavaScript value is represented as an `i32`.
-    pub fn is_repr_as_i32(&self) -> bool {
-        self.get_tag() == JS_TAG_INT
-    }
-
-    /// Checks if the JavaScript value is a string.
-    pub fn is_str(&self) -> bool {
-        self.get_tag() == JS_TAG_STRING
-    }
-
-    /// Checks if the JavaScript value is a boolean.
-    pub fn is_bool(&self) -> bool {
-        self.get_tag() == JS_TAG_BOOL
-    }
-
-    /// Checks if the JavaScript value is an array.
-    pub fn is_array(&self) -> bool {
-        unsafe { JS_IsArray(self.context.as_raw(), self.value) == 1 }
-    }
-
-    /// Checks if the JavaScript value is an object (excluding arrays).
-    pub fn is_object(&self) -> bool {
-        !self.is_array() && self.get_tag() == JS_TAG_OBJECT
-    }
-
-    /// Checks if the JavaScript value is an ArrayBuffer.
-    pub fn is_array_buffer(&self) -> bool {
-        (unsafe { JS_IsArrayBuffer_Ext(self.context.as_raw(), self.value) }) != 0
-    }
-
-    /// Checks if the JavaScript value is undefined.
-    pub fn is_undefined(&self) -> bool {
-        self.get_tag() == JS_TAG_UNDEFINED
-    }
-
-    /// Checks if the JavaScript value is null.
-    pub fn is_null(&self) -> bool {
-        self.get_tag() == JS_TAG_NULL
-    }
-
-    /// Checks if the JavaScript value is either null or undefined.
-    pub fn is_null_or_undefined(&self) -> bool {
-        self.is_null() | self.is_undefined()
-    }
-
-    /// Checks if the JavaScript value is a function.
-    pub fn is_function(&self) -> bool {
-        unsafe { JS_IsFunction(self.context.as_raw(), self.value) != 0 }
     }
 
     /// Retrieves the value of a property with the specified `key` from the JavaScript object.
@@ -428,11 +212,6 @@ impl<'a> JSValueRef<'a> {
         Ok(())
     }
 
-    /// Checks if the JavaScript value is an exception.
-    pub fn is_exception(&self) -> bool {
-        self.get_tag() == JS_TAG_EXCEPTION
-    }
-
     pub(crate) fn get_tag(&self) -> i32 {
         (self.value >> 32) as i32
     }
@@ -443,9 +222,35 @@ impl<'a> JSValueRef<'a> {
         Exception::new(self.context)
     }
 
-    /// Convert the `JSValueRef` to a Rust `JSValue` type.
-    fn to_js_value(&self) -> Result<JSValue> {
-        from_qjs_value(self)
+    pub fn type_of(&self) -> JSValueType {
+        let tag = self.get_tag();
+        match tag {
+            JS_TAG_INT => JSValueType::Int,
+            JS_TAG_BOOL => JSValueType::Bool,
+            JS_TAG_NULL => JSValueType::Null,
+            JS_TAG_UNDEFINED => JSValueType::Undefined,
+            // JS_TAG_FLOAT64 => JSValueType::Float,
+            // JS_TAG_BIG_DECIMAL => JSValueType::BigDecimal,
+            JS_TAG_BIG_INT => JSValueType::BigInt,
+            JS_TAG_BIG_FLOAT => JSValueType::BigFloat,
+            JS_TAG_SYMBOL => JSValueType::Symbol,
+            JS_TAG_STRING => JSValueType::String,
+            JS_TAG_OBJECT
+                if unsafe { JS_IsArrayBuffer_Ext(self.context.as_raw(), self.value) == 1 } =>
+            {
+                JSValueType::ArrayBuffer
+            }
+            JS_TAG_OBJECT if unsafe { JS_IsArray(self.context.as_raw(), self.value) == 1 } => {
+                JSValueType::Array
+            }
+            JS_TAG_OBJECT if unsafe { JS_IsFunction(self.context.as_raw(), self.value) == 1 } => {
+                JSValueType::Function
+            }
+            JS_TAG_OBJECT => JSValueType::Object,
+            JS_TAG_EXCEPTION => JSValueType::Exception,
+            t if unsafe { JS_IsFloat64_Ext(t) == 1 } => JSValueType::Float,
+            _ => JSValueType::Unknown,
+        }
     }
 }
 impl<'a> Clone for JSValueRef<'a> {
@@ -465,7 +270,15 @@ impl<'a> Drop for JSValueRef<'a> {
 }
 impl<'a> Debug for JSValueRef<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "JSValueRef({:?}, 0x{:x})", self.context, self.value)
+        write!(
+            f,
+            "JSValueRef({:?}, 0x{:x})[{:?}]",
+            self.context,
+            self.value,
+            self.type_of()
+        )?;
+
+        Ok(())
     }
 }
 
@@ -481,51 +294,249 @@ impl Into<JSValueRaw> for JSValueRef<'_> {
 
 impl fmt::Display for JSValueRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_js_value().unwrap())
+        match crate::js_value::qjs_convert::from_qjs_value(self) {
+            Ok(v) => write!(f, "{}", v),
+            Err(_) => write!(f, "{:?}", self), // TODO: is this better than outright crashing?
+        }
     }
 }
 
-/// A macro to implement the `TryFrom<&JSValueRef>` and `TryFrom<JSValueRef>` trait
-/// for various Rust types.
-macro_rules! try_from_impl {
-    ($($t:ty),+ $(,)?) => {
-        $(impl TryFrom<&JSValueRef<'_>> for $t {
-            type Error = anyhow::Error;
-
-            fn try_from(value: &JSValueRef) -> Result<Self> {
-                value.to_js_value()?.try_into()
-            }
+impl JSValueRef<'_> {
+    fn try_to_buffer_ptr(&self) -> Result<(*mut u8, usize)> {
+        let mut len: JS_size_t = 0;
+        let ptr = unsafe { JS_GetArrayBuffer(self.context.as_raw(), &mut len, self.value) };
+        if ptr.is_null() {
+            anyhow::bail!("Can't represent {:?} as a buffer", self.value);
         }
 
-        impl TryFrom<JSValueRef<'_>> for $t {
-            type Error = anyhow::Error;
+        Ok((ptr, len as usize))
+    }
 
-            fn try_from(value: JSValueRef) -> Result<Self> {
-                value.to_js_value()?.try_into()
+    fn try_to_str_wtf8(&self) -> Result<&[u8]> {
+        let mut len: JS_size_t = 0;
+        // TODO: should we free this string?
+        let ptr = unsafe { JS_ToCStringLen2(self.context.as_raw(), &mut len, self.value, 0) }
+            as *const u8;
+
+        if ptr.is_null() {
+            anyhow::bail!("Can't get string representation of {:?}", self.value);
+        }
+
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+    }
+
+    /// Converts the JavaScript value to a string.
+    ///
+    /// The difference between this method and `TryInto<&str>` implementation is that this method will coerce
+    /// values into a string.
+    pub fn try_to_str(&self) -> Result<&str> {
+        let buffer = self.try_to_str_wtf8()?;
+        Ok(str::from_utf8(buffer)?)
+    }
+
+    /// Converts the JavaScript value to a string, replacing any invalid UTF-8 sequences with the
+    /// Unicode replacement character (U+FFFD).
+    pub fn try_to_str_lossy(&self) -> Result<std::borrow::Cow<str>> {
+        let mut buffer = self.try_to_str_wtf8()?;
+        let res = match str::from_utf8(buffer) {
+            Ok(valid) => Cow::Borrowed(valid),
+            Err(mut error) => {
+                let mut res = String::new();
+                loop {
+                    let (valid, after_valid) = buffer.split_at(error.valid_up_to());
+                    res.push_str(unsafe { str::from_utf8_unchecked(valid) });
+                    res.push(char::REPLACEMENT_CHARACTER);
+
+                    // see https://simonsapin.github.io/wtf-8/#surrogate-byte-sequence
+                    let lone_surrogate =
+                        matches!(after_valid, [0xED, 0xA0..=0xBF, 0x80..=0xBF, ..]);
+
+                    // https://simonsapin.github.io/wtf-8/#converting-wtf-8-utf-8 states that each
+                    // 3-byte lone surrogate sequence should be replaced by 1 UTF-8 replacement
+                    // char. Rust's `Utf8Error` reports each byte in the lone surrogate byte
+                    // sequence as a separate error with an `error_len` of 1. Since we insert a
+                    // replacement char for each error, this results in 3 replacement chars being
+                    // inserted. So we use an `error_len` of 3 instead of 1 to treat the entire
+                    // 3-byte sequence as 1 error instead of as 3 errors and only emit 1
+                    // replacement char.
+                    let error_len = if lone_surrogate {
+                        3
+                    } else {
+                        error
+                            .error_len()
+                            .expect("Error length should always be available on underlying buffer")
+                    };
+
+                    buffer = &after_valid[error_len..];
+                    match str::from_utf8(buffer) {
+                        Ok(valid) => {
+                            res.push_str(valid);
+                            break;
+                        }
+                        Err(e) => error = e,
+                    }
+                }
+                Cow::Owned(res)
             }
-        })+
-    };
+        };
+
+        Ok(res)
+    }
 }
-try_from_impl!(
-    bool,
-    i32,
-    usize,
-    f64,
-    String,
-    Vec<JSValue>,
-    Vec<u8>,
-    std::collections::HashMap<String, JSValue>,
-);
+impl TryFrom<&JSValueRef<'_>> for bool {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &JSValueRef) -> Result<Self> {
+        match value.type_of() {
+            JSValueType::Bool => Ok(value.value as i32 > 0),
+            _ => anyhow::bail!("Can't represent {:?} as bool", value.value),
+        }
+    }
+}
+impl TryFrom<&JSValueRef<'_>> for i64 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &JSValueRef) -> Result<Self> {
+        // There is a JS_ToInt64Ext but that one doesn't report overflow :/
+        let mut int = 0_i64;
+
+        let err = match value.type_of() {
+            JSValueType::BigInt => unsafe {
+                JS_BigIntToInt64(value.context.as_raw(), &mut int, value.value)
+            },
+            JSValueType::Float | JSValueType::BigFloat => {
+                /// Maximum safe range of i64 expressed as f64.
+                const MAX_SAFE_RANGE_FLOAT: RangeInclusive<f64> = i64::MIN as f64..=i64::MAX as f64;
+
+                let float = f64::try_from(value)?;
+                if float.fract() == 0.0 && MAX_SAFE_RANGE_FLOAT.contains(&float) {
+                    int = float as i64;
+                    0
+                } else {
+                    // infinite, NaN, has fractional part or doesn't fit into an integer
+                    -1
+                }
+            }
+            _ => unsafe {
+                // this function can coerce:
+                // Int
+                // Bool
+                // Null
+                // Undefined
+                // Float
+                // BigFloat
+                //
+                // unfortunately float overflows aren't reported
+                JS_ToInt64(value.context.as_raw(), &mut int, value.value)
+            },
+        };
+
+        if err != 0 {
+            anyhow::bail!("Value is not a number or does not fit into i64")
+        }
+
+        Ok(int)
+    }
+}
+impl TryFrom<&JSValueRef<'_>> for u64 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &JSValueRef) -> Result<Self> {
+        let uint = match value.type_of() {
+            JSValueType::BigInt => {
+                let mut uint = 0u64;
+                let err =
+                    unsafe { JS_BigIntToUint64(value.context.as_raw(), &mut uint, value.value) };
+                if err != 0 {
+                    anyhow::bail!("Value is not a number or does not fit into u64")
+                }
+
+                uint
+            }
+            JSValueType::Float | JSValueType::BigFloat => {
+                /// Maximum safe range of u64 expressed as f64.
+                const MAX_SAFE_RANGE_FLOAT: RangeInclusive<f64> = u64::MIN as f64..=u64::MAX as f64;
+
+                let float = f64::try_from(value)?;
+                if float.fract() == 0.0 && MAX_SAFE_RANGE_FLOAT.contains(&float) {
+                    float as u64
+                } else {
+                    anyhow::bail!("Value does not fit into u64")
+                }
+            }
+            _ => u64::try_from(i64::try_from(value)?)?,
+        };
+
+        Ok(uint)
+    }
+}
+impl TryFrom<&JSValueRef<'_>> for f64 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &JSValueRef) -> Result<Self> {
+        let mut float = 0f64;
+
+        // this handles:
+        // Int
+        // Bool
+        // Null
+        // Float
+        // BigInt
+        // BigFloat
+        // TODO: and aborts for others??
+        let err = unsafe { JS_ToFloat64(value.context.as_raw(), &mut float, value.value) };
+        if err != 0 {
+            anyhow::bail!("Value is not a number");
+        }
+
+        Ok(float)
+    }
+}
+impl<'a> TryFrom<&'a JSValueRef<'_>> for &'a [u8] {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &'a JSValueRef) -> Result<Self> {
+        let (ptr, len) = value.try_to_buffer_ptr()?;
+
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+}
+impl<'a> TryFrom<&'a JSValueRef<'_>> for &'a mut [u8] {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &'a JSValueRef) -> Result<Self> {
+        let (ptr, len) = value.try_to_buffer_ptr()?;
+
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+    }
+}
+impl<'a> TryFrom<&'a JSValueRef<'_>> for &'a str {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &'a JSValueRef) -> Result<Self> {
+        match value.type_of() {
+            JSValueType::String => value.try_to_str(),
+            _ => anyhow::bail!("Value must be a string"),
+        }
+    }
+}
+impl TryFrom<&JSValueRef<'_>> for usize {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &JSValueRef) -> Result<Self> {
+        let uint = u64::try_from(value)?;
+        Ok(usize::try_from(uint)?)
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use super::JSValueType;
 
     use crate::js_binding::constants::MAX_SAFE_INTEGER;
     use crate::js_binding::constants::MIN_SAFE_INTEGER;
 
-    use super::BigInt;
-    use super::{JSContextRef, JSValue};
+    use super::JSContextRef;
     use anyhow::Result;
     const SCRIPT_NAME: &str = "value.js";
 
@@ -547,7 +558,7 @@ mod tests {
         obj.set_property("foo", ctx.value_from_i32(1_i32)?)?;
         let val = obj.get_property("foo");
         assert!(val.is_ok());
-        assert!(val.unwrap().is_repr_as_i32());
+        assert_eq!(val.unwrap().type_of(), JSValueType::Int);
         Ok(())
     }
 
@@ -561,10 +572,10 @@ mod tests {
             .unwrap();
 
         let val = seq.get_indexed_property(0).unwrap();
-        assert_eq!("hello", val.as_str().unwrap());
+        assert_eq!(<&str>::try_from(&val).unwrap(), "hello");
 
         let val = seq.get_indexed_property(1).unwrap();
-        assert_eq!("world", val.as_str().unwrap());
+        assert_eq!(<&str>::try_from(&val).unwrap(), "world");
     }
 
     #[test]
@@ -603,14 +614,14 @@ mod tests {
             .get_property("arr")?
             .get_indexed_property(0);
         assert!(val.is_ok());
-        assert!(val.unwrap().is_repr_as_i32());
+        assert_eq!(val.unwrap().type_of(), JSValueType::Int);
         Ok(())
     }
 
     #[test]
     fn test_allows_representing_a_value_as_f64() -> Result<()> {
         let ctx = JSContextRef::default();
-        let val = ctx.value_from_f64(f64::MIN)?.as_f64_unchecked();
+        let val = f64::try_from(&ctx.value_from_f64(f64::MIN)?).unwrap();
         assert_eq!(val, f64::MIN);
         Ok(())
     }
@@ -620,7 +631,7 @@ mod tests {
         let s = "hello";
         let ctx = JSContextRef::default();
         let val = ctx.value_from_str(s).unwrap();
-        assert_eq!(val.as_str().unwrap(), s);
+        assert_eq!(<&str>::try_from(&val).unwrap(), s);
     }
 
     #[test]
@@ -628,7 +639,7 @@ mod tests {
         let s = "hello\0world!";
         let ctx = JSContextRef::default();
         let val = ctx.value_from_str(s).unwrap();
-        assert_eq!(val.as_str().unwrap(), s);
+        assert_eq!(<&str>::try_from(&val).unwrap(), s);
     }
 
     #[test]
@@ -683,13 +694,13 @@ mod tests {
     fn test_is_null_or_undefined() {
         let ctx = JSContextRef::default();
         let v = ctx.undefined_value().unwrap();
-        assert!(v.is_null_or_undefined());
+        assert!(v.type_of().is_null_or_undefined());
 
         let v = ctx.null_value().unwrap();
-        assert!(v.is_null_or_undefined());
+        assert!(v.type_of().is_null_or_undefined());
 
         let v = ctx.value_from_i32(1337).unwrap();
-        assert!(!v.is_null_or_undefined());
+        assert!(!v.type_of().is_null_or_undefined());
     }
 
     #[test]
@@ -699,57 +710,44 @@ mod tests {
         // max
         let val = i64::MAX;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(v.is_big_int());
-        assert!(!v.is_number());
-        assert_eq!(
-            BigInt::Unsigned(val as u64),
-            v.as_big_int_unchecked().unwrap()
-        );
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
 
         // min
         let val = i64::MIN;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(v.is_big_int());
-        assert!(!v.is_number());
-        assert_eq!(BigInt::Signed(val), v.as_big_int_unchecked().unwrap());
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
 
         // zero
         let val = 0;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(!v.is_big_int());
-        assert!(v.is_number());
-        assert_eq!(val, v.as_i32_unchecked() as i64);
+        assert_eq!(v.type_of(), JSValueType::Int);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
 
         // MAX_SAFE_INTEGER
         let val = MAX_SAFE_INTEGER;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(!v.is_big_int());
-        assert!(v.is_number());
-        assert_eq!(val, v.as_f64_unchecked() as i64);
+        assert_eq!(v.type_of(), JSValueType::Float);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
 
         // MAX_SAFE_INTGER + 1
         let val = MAX_SAFE_INTEGER + 1;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(v.is_big_int());
-        assert!(!v.is_number());
-        assert_eq!(
-            BigInt::Unsigned(val as u64),
-            v.as_big_int_unchecked().unwrap()
-        );
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
 
         // MIN_SAFE_INTEGER
         let val = MIN_SAFE_INTEGER;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(!v.is_big_int());
-        assert!(v.is_number());
-        assert_eq!(val, v.as_f64_unchecked() as i64);
+        assert_eq!(v.type_of(), JSValueType::Float);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
 
         // MIN_SAFE_INTEGER - 1
         let val = MIN_SAFE_INTEGER - 1;
         let v = ctx.value_from_i64(val).unwrap();
-        assert!(v.is_big_int());
-        assert!(!v.is_number());
-        assert_eq!(BigInt::Signed(val), v.as_big_int_unchecked().unwrap());
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(i64::try_from(&v).unwrap(), val);
     }
 
     #[test]
@@ -759,30 +757,26 @@ mod tests {
         // max
         let val = u64::MAX;
         let v = ctx.value_from_u64(val).unwrap();
-        assert!(v.is_big_int());
-        assert!(!v.is_number());
-        assert_eq!(BigInt::Unsigned(val), v.as_big_int_unchecked().unwrap());
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(u64::try_from(&v).unwrap(), val);
 
         // min == 0
         let val = u64::MIN;
         let v = ctx.value_from_u64(val).unwrap();
-        assert!(!v.is_big_int());
-        assert!(v.is_number());
-        assert_eq!(val, v.as_i32_unchecked() as u64);
+        assert_eq!(v.type_of(), JSValueType::Int);
+        assert_eq!(i64::try_from(&v).unwrap() as u64, val);
 
         // MAX_SAFE_INTEGER
         let val = MAX_SAFE_INTEGER as u64;
         let v = ctx.value_from_u64(val).unwrap();
-        assert!(!v.is_big_int());
-        assert!(v.is_number());
-        assert_eq!(val, v.as_f64_unchecked() as u64);
+        assert_eq!(v.type_of(), JSValueType::Float);
+        assert_eq!(i64::try_from(&v).unwrap() as u64, val);
 
         // MAX_SAFE_INTEGER + 1
-        let val = (MAX_SAFE_INTEGER + 1) as u64;
+        let val = MAX_SAFE_INTEGER as u64 + 1;
         let v = ctx.value_from_u64(val).unwrap();
-        assert!(v.is_big_int());
-        assert!(!v.is_number());
-        assert_eq!(BigInt::Unsigned(val), v.as_big_int_unchecked().unwrap());
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(u64::try_from(&v).unwrap(), val);
     }
 
     #[test]
@@ -793,10 +787,10 @@ mod tests {
             .unwrap(); // u64::MAX + 1
         let num = ctx.global_object().unwrap().get_property("num").unwrap();
 
-        assert!(num.is_big_int());
+        assert_eq!(num.type_of(), JSValueType::BigInt);
         assert_eq!(
-            "big int overflow, value does not fit in u64",
-            num.as_big_int_unchecked().unwrap_err().to_string()
+            u64::try_from(&num).unwrap_err().to_string(),
+            "Value is not a number or does not fit into u64"
         );
     }
 
@@ -808,10 +802,10 @@ mod tests {
             .unwrap(); // i64::MIN - 1
         let num = ctx.global_object().unwrap().get_property("num").unwrap();
 
-        assert!(num.is_big_int());
+        assert_eq!(num.type_of(), JSValueType::BigInt);
         assert_eq!(
-            "big int underflow, value does not fit in i64",
-            num.as_big_int_unchecked().unwrap_err().to_string()
+            i64::try_from(&num).unwrap_err().to_string(),
+            "Value is not a number or does not fit into i64"
         );
     }
 
@@ -819,14 +813,11 @@ mod tests {
     fn test_u64_creates_an_unsigned_bigint() {
         let ctx = JSContextRef::default();
 
-        let expected = i64::MAX as u64 + 2;
-        let v = ctx.value_from_u64(expected).unwrap();
+        let val = i64::MAX as u64 + 2;
+        let v = ctx.value_from_u64(val).unwrap();
 
-        assert!(v.is_big_int());
-        assert_eq!(
-            BigInt::Unsigned(expected),
-            v.as_big_int_unchecked().unwrap()
-        );
+        assert_eq!(v.type_of(), JSValueType::BigInt);
+        assert_eq!(u64::try_from(&v).unwrap(), val);
     }
 
     #[test]
@@ -836,19 +827,23 @@ mod tests {
         ctx.eval_global("main", "var x = 42; function foo() {}")
             .unwrap();
 
-        assert!(!ctx
-            .global_object()
-            .unwrap()
-            .get_property("x")
-            .unwrap()
-            .is_function());
+        assert_ne!(
+            ctx.global_object()
+                .unwrap()
+                .get_property("x")
+                .unwrap()
+                .type_of(),
+            JSValueType::Function
+        );
 
-        assert!(ctx
-            .global_object()
-            .unwrap()
-            .get_property("foo")
-            .unwrap()
-            .is_function());
+        assert_eq!(
+            ctx.global_object()
+                .unwrap()
+                .get_property("foo")
+                .unwrap()
+                .type_of(),
+            JSValueType::Function
+        );
     }
 
     #[test]
@@ -862,13 +857,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            42,
-            ctx.global_object()
-                .unwrap()
-                .get_property("f")
-                .unwrap()
-                .try_as_integer()
-                .unwrap()
+            i64::try_from(&ctx.global_object().unwrap().get_property("f").unwrap()).unwrap(),
+            42
         );
     }
 
@@ -877,45 +867,39 @@ mod tests {
         let context = JSContextRef::default();
         let val = context.eval_global("test.js", "true")?;
 
-        assert_eq!("true", val.to_string());
+        assert_eq!(val.to_string(), "true");
 
         let val_ref = &val;
         let arg: bool = val_ref.try_into()?;
         assert!(arg);
-        let arg: bool = val.try_into()?;
-        assert!(arg);
 
         Ok(())
     }
 
     #[test]
-    fn test_convert_i32() -> Result<()> {
+    fn test_convert_i64() -> Result<()> {
         let context = JSContextRef::default();
         let val = context.eval_global("test.js", "42")?;
 
-        assert_eq!("42", val.to_string());
+        assert_eq!(val.to_string(), "42");
 
         let val_ref = &val;
-        let arg: i32 = val_ref.try_into()?;
-        assert_eq!(42, arg);
-        let arg: i32 = val.try_into()?;
-        assert_eq!(42, arg);
+        let arg: i64 = val_ref.try_into()?;
+        assert_eq!(arg, 42);
 
         Ok(())
     }
 
     #[test]
-    fn test_convert_usize() -> Result<()> {
+    fn test_convert_u64() -> Result<()> {
         let context = JSContextRef::default();
         let val = context.eval_global("test.js", "42")?;
 
-        assert_eq!("42", val.to_string());
+        assert_eq!(val.to_string(), "42");
 
         let val_ref = &val;
-        let arg: usize = val_ref.try_into()?;
-        assert_eq!(42, arg);
-        let arg: usize = val.try_into()?;
-        assert_eq!(42, arg);
+        let arg: u64 = val_ref.try_into()?;
+        assert_eq!(arg, 42);
 
         Ok(())
     }
@@ -925,47 +909,25 @@ mod tests {
         let context = JSContextRef::default();
         let val = context.eval_global("test.js", "42.42")?;
 
-        assert_eq!("42.42", val.to_string());
+        assert_eq!(val.to_string(), "42.42");
 
         let val_ref = &val;
         let arg: f64 = val_ref.try_into()?;
-        assert_eq!(42.42, arg);
-        let arg: f64 = val.try_into()?;
-        assert_eq!(42.42, arg);
+        assert_eq!(arg, 42.42);
 
         Ok(())
     }
 
     #[test]
-    fn test_convert_string() -> Result<()> {
+    fn test_convert_str() -> Result<()> {
         let context = JSContextRef::default();
         let val = context.eval_global("test.js", "const h = 'hello'; h")?;
 
-        assert_eq!("hello", val.to_string());
+        assert_eq!(val.to_string(), "hello");
 
         let val_ref = &val;
-        let arg: String = val_ref.try_into()?;
-        assert_eq!("hello", arg);
-        let arg: String = val.try_into()?;
-        assert_eq!("hello", arg);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_vec() -> Result<()> {
-        let context = JSContextRef::default();
-        let val = context.eval_global("test.js", "[1, 2, 3]")?;
-
-        let expected: Vec<JSValue> = vec![1.into(), 2.into(), 3.into()];
-
-        assert_eq!("1,2,3", val.to_string());
-
-        let val_ref = &val;
-        let arg: Vec<JSValue> = val_ref.try_into()?;
-        assert_eq!(expected, arg);
-        let arg: Vec<JSValue> = val.try_into()?;
-        assert_eq!(expected, arg);
+        let arg: &str = val_ref.try_into()?;
+        assert_eq!(arg, "hello");
 
         Ok(())
     }
@@ -977,35 +939,11 @@ mod tests {
 
         let expected = [0_u8; 8].to_vec();
 
-        assert_eq!("[object ArrayBuffer]", val.to_string());
+        assert_eq!(val.to_string(), "[object ArrayBuffer]");
 
         let val_ref = &val;
-        let arg: Vec<u8> = val_ref.try_into()?;
-        assert_eq!(expected, arg);
-        let arg: Vec<u8> = val.try_into()?;
-        assert_eq!(expected, arg);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_hashmap() -> Result<()> {
-        let context = JSContextRef::default();
-        let val = context.eval_global("test.js", "({a: 1, b: 2, c: 3})")?;
-
-        let expected = HashMap::from([
-            ("a".to_string(), 1.into()),
-            ("b".to_string(), 2.into()),
-            ("c".to_string(), 3.into()),
-        ]);
-
-        assert_eq!("[object Object]", val.to_string());
-
-        let val_ref = &val;
-        let arg: HashMap<String, JSValue> = val_ref.try_into()?;
-        assert_eq!(expected, arg);
-        let arg: HashMap<String, JSValue> = val.try_into()?;
-        assert_eq!(expected, arg);
+        let arg: &[u8] = val_ref.try_into()?;
+        assert_eq!(arg, expected);
 
         Ok(())
     }

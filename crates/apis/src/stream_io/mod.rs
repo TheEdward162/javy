@@ -13,7 +13,7 @@ impl JSApiSet for StreamIO {
         let global = context.global_object()?;
 
         let mut javy_object = global.get_property("Javy")?;
-        if javy_object.is_undefined() {
+        if javy_object.type_of() == javy::quickjs::JSValueType::Undefined {
             javy_object = context.object_value()?;
             global.set_property("Javy", javy_object)?;
         }
@@ -26,11 +26,11 @@ impl JSApiSet for StreamIO {
                 };
 
                 let mut fd: Box<dyn Write> = match fd.try_into()? {
-                    1 => Box::new(std::io::stdout()),
+                    1u64 => Box::new(std::io::stdout()),
                     2 => Box::new(std::io::stderr()),
                     _ => anyhow::bail!("Only stdout and stderr are supported"),
                 };
-                let data: Vec<u8> = data.try_into()?;
+                let data: &[u8] = data.try_into()?;
                 let offset: usize = offset.try_into()?;
                 let length: usize = length.try_into()?;
                 let data = &data[offset..(offset + length)];
@@ -47,15 +47,15 @@ impl JSApiSet for StreamIO {
                     anyhow::bail!("Invalid number of parameters");
                 };
                 let mut fd: Box<dyn Read> = match fd.try_into()? {
-                    0 => Box::new(std::io::stdin()),
+                    0u64 => Box::new(std::io::stdin()),
                     _ => anyhow::bail!("Only stdin is supported"),
                 };
                 let offset: usize = offset.try_into()?;
                 let length: usize = length.try_into()?;
-                if !data.is_array_buffer() {
+                if data.type_of() != javy::quickjs::JSValueType::ArrayBuffer {
                     anyhow::bail!("Data needs to be an ArrayBuffer");
                 }
-                let data = data.as_bytes_mut()?;
+                let data: &mut [u8] = data.try_into()?;
                 let data = &mut data[offset..(offset + length)];
                 let n = fd.read(data)?;
                 Ok(n.into())
